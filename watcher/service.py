@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -32,6 +33,18 @@ class Service:
     def require_admin(self, actor):
         if actor != self.admin:
             raise UserNotice("Действие доступно администратору.")
+
+    async def restore_bindings_if_needed(self):
+        async with self.lock:
+            if not self.store.row("SELECT id FROM pending_binding_restore"):
+                return
+            bindings = await self.panel.list_bindings()
+            # The marker survives failures, including a restart after a user has
+            # independently rediscovered one of their subscriptions via the menu.
+            with self.store.db as db:
+                db.executemany("INSERT OR REPLACE INTO clients(id,email,owner) VALUES (?,?,?)", bindings)
+                db.execute("DELETE FROM pending_binding_restore")
+            logging.getLogger(__name__).info("Restored %d client bindings from 3x-ui", len(bindings))
 
     async def subscriptions(self, user):
         clients = await self.panel.owned(user)

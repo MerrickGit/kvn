@@ -17,6 +17,9 @@ class Store:
             CREATE TABLE IF NOT EXISTS contacts(user INTEGER PRIMARY KEY, entering INTEGER DEFAULT 0);
             CREATE TABLE IF NOT EXISTS clients(id INTEGER PRIMARY KEY, email TEXT, owner INTEGER);
             CREATE INDEX IF NOT EXISTS client_owners ON clients(owner);
+            CREATE TABLE IF NOT EXISTS pending_binding_restore(id INTEGER PRIMARY KEY CHECK(id=1));
+            INSERT OR IGNORE INTO pending_binding_restore(id)
+                SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM clients WHERE owner>0);
             CREATE TABLE IF NOT EXISTS requests(
                 id INTEGER PRIMARY KEY, kind TEXT NOT NULL, user INTEGER NOT NULL, username TEXT,
                 email TEXT NOT NULL, client_id INTEGER, owner INTEGER, expiry INTEGER, issue TEXT,

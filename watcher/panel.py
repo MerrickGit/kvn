@@ -128,6 +128,31 @@ class Panel:
             raise PanelError("Несовместимый ответ при поиске по Telegram ID.")
         return [client for row in rows if (client := self.parse(row)).owner == user]
 
+    async def list_bindings(self) -> list[tuple[int, str, int]]:
+        # In 3.11.0 /list returns flat ClientRecords. /list/paged omits tgId.
+        rows = await self._request("GET", "list")
+        if not isinstance(rows, list):
+            raise PanelError("Панель вернула некорректный список клиентов.")
+        bindings = []
+        try:
+            for row in rows:
+                owner = row["tgId"]
+                if isinstance(owner, str):
+                    owner = int(owner or 0)
+                if owner is None:
+                    continue
+                if type(owner) is not int or owner > 2**63 - 1:
+                    raise ValueError()
+                if owner <= 0:
+                    continue
+                cid, email = row["id"], row["email"]
+                if type(cid) is not int or not 0 < cid < 2**63 or not isinstance(email, str) or not valid_email(email):
+                    raise ValueError()
+                bindings.append((cid, email, owner))
+        except (KeyError, ValueError, TypeError) as exc:
+            raise PanelError("Некорректная привязка в списке клиентов 3x-ui.") from exc
+        return bindings
+
     async def change(self, client, field, value, *, activate=False):
         await self._request("POST", "update/" + quote(client.email, safe=""),
                             client.write_body(field, value, activate=activate))

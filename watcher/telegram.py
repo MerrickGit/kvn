@@ -273,11 +273,12 @@ async def worker(s, bot):
                 next_delivery = time.monotonic() + pause
             if time.monotonic() >= next_reminders:
                 try:
+                    await s.restore_bindings_if_needed()
                     await s.reminders()
                     next_reminders = time.monotonic() + 3600
-                except PanelError:
+                except PanelError as exc:
                     next_reminders = time.monotonic() + 60
-                    log.warning("Panel unavailable during reminder scan")
+                    log.warning("Binding restore or reminder scan deferred: %s", exc)
         except Exception as exc:
             log.error("Background operation failed (%s)", type(exc).__name__)
         await asyncio.sleep(5)
