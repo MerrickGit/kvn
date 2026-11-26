@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import (TelegramAPIError, TelegramBadRequest, TelegramForbiddenError,
                                TelegramRetryAfter)
 from aiogram.filters import Command, CommandStart
@@ -17,6 +17,29 @@ log = logging.getLogger(__name__)
 STATES = {"pending": "ожидает решения", "applying": "изменение отправляется в панель",
           "review": "нужна ручная проверка", "done": "выполнена", "rejected": "отклонена",
           "correction": "запрошено исправление Email"}
+MENU = "Управление подпиской. Выберите действие."
+
+
+class OncePerUpdate(BaseMiddleware):
+    def __init__(self, store):
+        self.store = store
+        self.active = set()
+
+    async def __call__(self, handler, event, data):
+        key = (data["bot"].id, event.update_id)
+        cutoff = now_ms() - 2 * DAY
+        if key in self.active or self.store.row(
+                "SELECT 1 FROM handled_updates WHERE bot=? AND update_id=? AND handled>=?", *key, cutoff):
+            return
+        self.active.add(key)
+        try:
+            result = await handler(event, data)
+            with self.store.db as db:
+                db.execute("DELETE FROM handled_updates WHERE handled<?", (cutoff,))
+                db.execute("INSERT OR REPLACE INTO handled_updates VALUES (?,?,?)", (*key, now_ms()))
+            return result
+        finally:
+            self.active.remove(key)
 
 
 def keyboard(*buttons):
@@ -84,21 +107,29 @@ async def card(s, rid, confirm=False):
     elif state == "review":
         lines.append("После сверки повтор использует ранее сохранённую цель.")
         actions.extend([("Проверил, повторить сверку", "retry:" + key), ("Закрыть заявку", "reject:" + key)])
-    elif state == "done" and kind == "renew":
-        lines.append("Продлено до " + s.date(r["target"]))
+    elif state == "done":
+        lines.append("Продлено до " + s.date(r["target"]) if kind == "renew"
+                     else "Текущий срок — " + s.date(r["expiry"]))
+    elif state == "correction" and r["user"] == s.admin:
+        lines.append("Пришлите исправленный Email одним сообщением.")
     elif state == "applying":
         lines.append("Бот автоматически сверит результат после восстановления связи.")
         actions.append(("Обновить", f"card:{rid}"))
+    if state in {"done", "rejected", "correction"} and r["user"] == s.admin:
+        actions.append(("Главное меню", "home"))
     return "\n".join(lines), keyboard(*actions)
 
 
-async def edit_or_send(message, text, markup):
+async def edit_or_send(bot, chat_id, message_id, text, markup):
     try:
-        await message.edit_text(text, reply_markup=markup)
+        await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
     except TelegramBadRequest as exc:
-        if "message is not modified" in exc.message.lower():
+        reason = exc.message.lower()
+        if "message is not modified" in reason:
             return
-        await message.answer(text, reply_markup=markup)
+        if "message to edit not found" not in reason and "message can't be edited" not in reason:
+            raise
+        await bot.send_message(chat_id, text, reply_markup=markup)
 
 
 def dispatcher(s):
@@ -108,7 +139,7 @@ def dispatcher(s):
     @router.message(CommandStart())
     async def start(m: Message):
         s.store.contact(m.from_user.id)
-        await m.answer("Управление подпиской. Выберите действие.", reply_markup=home(s, m.from_user.id))
+        await m.answer(MENU, reply_markup=home(s, m.from_user.id))
 
     @router.message(Command("id"))
     async def user_id(m: Message):
@@ -126,7 +157,8 @@ def dispatcher(s):
                 result = await s.register(uid, m.from_user.username, m.text)
             except UserNotice as exc:
                 result = str(exc)
-        await m.answer(result, reply_markup=home(s, uid))
+        if result is not None:
+            await m.answer(result, reply_markup=home(s, uid))
 
     @router.callback_query()
     async def click(q: CallbackQuery):
@@ -136,65 +168,87 @@ def dispatcher(s):
             return
         args = (q.data or "").split(":")
         action = args[0]
-        admin_actions = {"queue", "card", "approve", "activate", "confirm", "replace", "retry", "reject", "correct"}
+        admin_actions = {"queue", "open", "card", "approve", "activate", "confirm", "replace", "retry", "reject", "correct"}
         if action in admin_actions and uid != s.admin:
             await q.answer("Доступно администратору.", show_alert=True)
             return
         await q.answer()
         async with s.lock:
             try:
-                if action == "reg":
+                if action == "home":
+                    s.store.contact(uid)
+                    await edit_or_send(q.bot, uid, m.message_id, MENU, home(s, uid))
+                elif action == "reg":
                     s.store.contact(uid, entering=True)
                     await m.answer("Введите Email из карточки 3x-ui. Подойдёт и имя вида ivan-vpn.")
                 elif action == "subs":
-                    clients = await s.subscriptions(uid)
+                    clients = sorted(await s.subscriptions(uid), key=lambda c: c.id)
                     if not clients:
-                        await m.answer("Привязанных подписок пока нет.", reply_markup=home(s, uid))
-                    for c in clients:
+                        await edit_or_send(q.bot, uid, m.message_id, "Привязанных подписок пока нет.", home(s, uid))
+                    else:
+                        page = min(max(0, int(args[1]) if len(args) > 1 else 0), len(clients) - 1)
+                        c = clients[page]
                         details = f"{c.email}\nСрок — {s.date(c.expiry)}."
                         if c.exception:
                             details += "\n" + c.exception
-                        await m.answer(details, reply_markup=keyboard(pay_button(c)))
+                        buttons = [pay_button(c)]
+                        if len(clients) > 1:
+                            details += f"\nПодписка {page + 1} из {len(clients)}."
+                        if page:
+                            buttons.append(("Предыдущая подписка", f"subs:{page - 1}"))
+                        if page + 1 < len(clients):
+                            buttons.append(("Следующая подписка", f"subs:{page + 1}"))
+                        buttons.append(("Главное меню", "home"))
+                        await edit_or_send(q.bot, uid, m.message_id, details, keyboard(*buttons))
                 elif action == "paid":
                     result = await s.paid(uid, q.from_user.username, int(args[1]), int(args[2]))
-                    await m.answer(result, reply_markup=home(s, uid))
+                    if result is not None:
+                        await m.answer(result, reply_markup=home(s, uid))
                 elif action == "queue":
                     offset = max(0, int(args[1]))
                     kind = args[2] if len(args) > 2 and args[2] in {"bind", "renew"} else ""
                     rows = s.store.rows("""SELECT id,kind,email,state FROM requests
                         WHERE state IN ('pending','applying','review') AND (?='' OR kind=?)
                         ORDER BY id LIMIT 11 OFFSET ?""", kind, kind, offset)
-                    items = [(f"№{r['id']} · {r['email']} · {STATES[r['state']]}", f"card:{r['id']}")
+                    items = [(f"№{r['id']} · {r['email']} · {STATES[r['state']]}", f"open:{r['id']}")
                              for r in rows[:10]]
                     if offset:
                         items.append(("Назад", f"queue:{max(0, offset - 10)}:{kind}"))
                     if len(rows) > 10:
                         items.append(("Дальше", f"queue:{offset + 10}:{kind}"))
-                    items.extend([("Регистрации", "queue:0:bind"), ("Продления", "queue:0:renew")])
-                    await m.answer("Заявки на рассмотрении" if rows else "Очередь пуста.",
-                                   reply_markup=keyboard(*items))
+                    items.extend([("Регистрации", "queue:0:bind"), ("Продления", "queue:0:renew"),
+                                  ("Главное меню", "home")])
+                    await edit_or_send(q.bot, uid, m.message_id,
+                                       "Заявки на рассмотрении" if rows else "Очередь пуста.", keyboard(*items))
                 elif action in admin_actions:
                     rid = int(args[1])
                     tip = None
-                    if action not in {"card", "confirm"}:
+                    decision = action not in {"card", "open", "confirm"}
+                    if decision:
                         rev = int(args[2])
                         try:
                             if action in ("approve", "replace", "activate"):
-                                await s.approve(rid, uid, rev, replace=action == "replace", activate=action == "activate")
+                                await s.approve(rid, uid, rev, replace=action == "replace",
+                                                activate=action == "activate", message_id=m.message_id)
                             elif action == "retry":
-                                await s.retry_review(rid, uid, rev)
+                                await s.retry_review(rid, uid, rev, message_id=m.message_id)
                             else:
-                                s.decline(rid, uid, rev, correction=action == "correct")
+                                s.decline(rid, uid, rev, correction=action == "correct", message_id=m.message_id)
                         except (UserNotice, PanelError) as exc:
                             tip = str(exc)
                     body, markup = await card(s, rid, confirm=action == "confirm")
                     if tip:
                         body = tip + "\n\n" + body
-                    # Queue buttons share one message; opening a request keeps the list intact.
-                    if action == "card":
+                    # Old queue messages use card: for opening a request as well.
+                    if action == "open" or (action == "card" and m.text == "Заявки на рассмотрении"):
                         await m.answer(body, reply_markup=markup)
                     else:
-                        await edit_or_send(m, body, markup)
+                        await edit_or_send(q.bot, uid, m.message_id, body, markup)
+                    if tip is None and action != "confirm":
+                        # This card now shows the state the outbox would deliver to the admin.
+                        with s.store.db as db:
+                            db.execute("""UPDATE outgoing SET status='sent' WHERE kind='card'
+                                          AND request_id=? AND chat=? AND status='waiting'""", (rid, uid))
                 else:
                     raise UserNotice("Откройте меню командой /start.")
             except (UserNotice, PanelError) as exc:
@@ -204,6 +258,7 @@ def dispatcher(s):
 
     dp = Dispatcher(disable_fsm=True)  # The registration prompt lives in SQLite.
     dp.update.outer_middleware(Admission(s.admin, s.limits))
+    dp.update.outer_middleware(OncePerUpdate(s.store))
     dp.include_router(router)
     return dp
 
@@ -211,9 +266,16 @@ def dispatcher(s):
 async def delivery(s, item):
     kind, uid = item["kind"], item["chat"]
     if kind == "card":
-        return await card(s, item["request_id"])
+        rid = item["request_id"]
+        r = s.store.request(rid)
+        if not r or (r["state"] in {"done", "rejected", "correction"} and item["fingerprint"] != f"done:{rid}"):
+            return None
+        return await card(s, rid)
     if kind == "text":
         return item["body"], home(s, uid)
+    if kind == "success" and s.store.row("SELECT 1 FROM outgoing WHERE fingerprint=? AND chat=?",
+                                         f"done:{item['request_id']}", uid):
+        return None  # Older releases queued both a success message and an admin card for this chat.
     clients = await s.subscriptions(uid)
     c = next((c for c in clients if c.id == item["client_id"]), None)
     if not c:
@@ -235,10 +297,21 @@ async def flush(s, bot: Bot):
         status, delay = "sent", 0
         telegram_pause = 0
         async with s.lock:
+            if not s.store.row("SELECT 1 FROM outgoing WHERE id=? AND status='waiting' AND available<=?",
+                               item["id"], s.clock()):
+                continue
             try:
                 payload = await delivery(s, item)
                 if payload:
-                    await bot.send_message(item["chat"], payload[0], reply_markup=payload[1])
+                    target = None
+                    if item["kind"] == "card":
+                        request = s.store.request(item["request_id"])
+                        if request["actor"] == item["chat"]:
+                            target = request["admin_message_id"]
+                    if target:
+                        await edit_or_send(bot, item["chat"], target, *payload)
+                    else:
+                        await bot.send_message(item["chat"], payload[0], reply_markup=payload[1])
                 else:
                     status = "obsolete"
             except TelegramRetryAfter as exc:
@@ -258,6 +331,7 @@ async def flush(s, bot: Bot):
 
 
 async def worker(s, bot):
+    next_restore = 0
     next_reminders = 0
     next_delivery = 0
     while True:
@@ -271,14 +345,22 @@ async def worker(s, bot):
             if time.monotonic() >= next_delivery:
                 pause = await flush(s, bot)
                 next_delivery = time.monotonic() + pause
-            if time.monotonic() >= next_reminders:
+            if next_restore is not None and time.monotonic() >= next_restore:
                 try:
                     await s.restore_bindings_if_needed()
+                except PanelError as exc:
+                    next_restore = time.monotonic() + 60
+                    log.warning("Binding restore deferred: %s", exc)
+                else:
+                    next_restore = None
+                    next_reminders = 0
+            if time.monotonic() >= next_reminders:
+                try:
                     await s.reminders()
                     next_reminders = time.monotonic() + 3600
-                except PanelError as exc:
+                except PanelError:
                     next_reminders = time.monotonic() + 60
-                    log.warning("Binding restore or reminder scan deferred: %s", exc)
+                    log.warning("Panel unavailable during reminder scan")
         except Exception as exc:
             log.error("Background operation failed (%s)", type(exc).__name__)
         await asyncio.sleep(5)

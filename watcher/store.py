@@ -33,7 +33,14 @@ class Store:
                 body TEXT, status TEXT DEFAULT 'waiting', attempts INTEGER DEFAULT 0,
                 available INTEGER DEFAULT 0);
             CREATE INDEX IF NOT EXISTS ready ON outgoing(status,available,id);
+            CREATE TABLE IF NOT EXISTS handled_updates(
+                bot INTEGER NOT NULL, update_id INTEGER NOT NULL, handled INTEGER NOT NULL,
+                PRIMARY KEY(bot,update_id));
+            CREATE INDEX IF NOT EXISTS handled_time ON handled_updates(handled);
         """)
+        if "admin_message_id" not in {r["name"] for r in self.rows("PRAGMA table_info(requests)")}:
+            with self.db:
+                self.db.execute("ALTER TABLE requests ADD COLUMN admin_message_id INTEGER")
         if "expires" not in {r["name"] for r in self.rows("PRAGMA table_info(contacts)")}:
             with self.db:
                 self.db.execute("ALTER TABLE contacts ADD COLUMN expires INTEGER DEFAULT 0")

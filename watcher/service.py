@@ -47,7 +47,8 @@ class Service:
             logging.getLogger(__name__).info("Restored %d client bindings from 3x-ui", len(bindings))
 
     async def subscriptions(self, user):
-        clients = await self.panel.owned(user)
+        rows = await self.panel.owned(user)
+        clients = list({client.id: client for client in rows}.values())
         with self.store.db:
             self.store.db.execute("DELETE FROM clients WHERE owner=?", (user,))
             for client in clients:
@@ -100,6 +101,8 @@ class Service:
             return f"Подписка уже привязана. Срок — {self.date(client.expiry)}."
         rid = self.create("bind", uid, username, email)
         self.store.contact(uid)
+        if uid == self.admin:
+            return None  # The new request card is also the acknowledgement in this chat.
         return f"Заявка на регистрацию №{rid} отправлена администратору."
 
     async def paid(self, uid, username, cid, expected):
@@ -120,6 +123,8 @@ class Service:
                 AND user=? AND expiry=? AND state='done'""", cid, uid, expected):
             raise UserNotice("Этот период уже продлён. Откройте «Моя подписка».")
         rid = self.create("renew", uid, username, cached["email"], cid, expected)
+        if uid == self.admin:
+            return None
         return f"Заявка о платеже №{rid} передана администратору."
 
     def facts(self, r, c):
@@ -159,7 +164,7 @@ class Service:
                           WHERE id=?""", (reason, r["id"]))
             self.notify_admin(self.store.request(r["id"]), reason)
 
-    async def approve(self, rid, actor, rev, replace=False, activate=False):
+    async def approve(self, rid, actor, rev, replace=False, activate=False, *, message_id=None):
         self.require_admin(actor)
         online = True
         try:
@@ -185,8 +190,8 @@ class Service:
             raise UserNotice(f"Сначала завершите заявку №{other['id']} по этому клиенту.")
         target = r["user"] if r["kind"] == "bind" else max(r["expiry"], self.clock()) + 30 * DAY
         with self.store.db as db:
-            db.execute("""UPDATE requests SET state='applying',target=?,actor=?,decided=?,rev=rev+1
-                          WHERE id=?""", (target, actor, self.clock(), rid))
+            db.execute("""UPDATE requests SET state='applying',target=?,actor=?,decided=?,rev=rev+1,
+                          admin_message_id=? WHERE id=?""", (target, actor, self.clock(), message_id, rid))
         if online:
             await self.reconcile(rid)
 
@@ -225,21 +230,23 @@ class Service:
                 self.notify_admin(self.store.request(rid), note)
             return
         with self.store.db as db:
-            db.execute("UPDATE requests SET state='done',note=NULL WHERE id=?", (rid,))
+            db.execute("""UPDATE requests SET state='done',note=NULL,
+                          expiry=CASE WHEN kind='bind' THEN ? ELSE expiry END WHERE id=?""", (c.expiry, rid))
             self.store.remember(c)
-            self.store.enqueue(f"result:{rid}", r["user"], "success", rid=rid, cid=c.id)
+            if r["user"] != self.admin:
+                self.store.enqueue(f"result:{rid}", r["user"], "success", rid=rid, cid=c.id)
             self.store.enqueue(f"done:{rid}", self.admin, "card", rid=rid)
 
-    async def retry_review(self, rid, actor, rev):
+    async def retry_review(self, rid, actor, rev, *, message_id=None):
         self.require_admin(actor)
         with self.store.db as db:
-            changed = db.execute("""UPDATE requests SET state='applying',rev=rev+1,actor=?
-                                    WHERE id=? AND state='review' AND rev=?""", (actor, rid, rev)).rowcount
+            changed = db.execute("""UPDATE requests SET state='applying',rev=rev+1,actor=?,admin_message_id=?
+                                    WHERE id=? AND state='review' AND rev=?""", (actor, message_id, rid, rev)).rowcount
         if not changed:
             raise UserNotice("Заявка уже изменилась.")
         await self.reconcile(rid)
 
-    def decline(self, rid, actor, rev, correction=False):
+    def decline(self, rid, actor, rev, correction=False, *, message_id=None):
         self.require_admin(actor)
         r = self.store.request(rid)
         if not r or r["rev"] != rev or r["state"] not in ("pending", "review"):
@@ -251,12 +258,15 @@ class Service:
         body = (f"Проверьте Email для заявки №{rid} и пришлите его ещё раз."
                 if correction else f"Администратор отклонил заявку {topic} №{rid}.")
         with self.store.db as db:
-            db.execute("UPDATE requests SET state=?,rev=rev+1,actor=?,decided=? WHERE id=?",
-                       (state, actor, self.clock(), rid))
+            db.execute("UPDATE requests SET state=?,rev=rev+1,actor=?,decided=?,admin_message_id=? WHERE id=?",
+                       (state, actor, self.clock(), message_id, rid))
             if correction:
                 db.execute("INSERT OR REPLACE INTO contacts(user,entering,expires) VALUES (?,1,?)",
                            (r["user"], now_ms() + DAY))
-            self.store.enqueue(f"result:{rid}", r["user"], "text", body=body)
+            if r["user"] == self.admin:
+                self.store.enqueue(f"done:{rid}", self.admin, "card", rid=rid)
+            else:
+                self.store.enqueue(f"result:{rid}", r["user"], "text", body=body)
 
     async def reminders(self):
         with self.store.db:

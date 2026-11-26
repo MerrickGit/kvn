@@ -3,6 +3,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, call, patch
 
 from watcher.panel import DAY, Panel, PanelError
@@ -84,6 +85,37 @@ class RestoreTests(unittest.IsolatedAsyncioTestCase):
         await s.restore_bindings_if_needed()
         self.panel._request.assert_awaited_once_with("GET", "list")
         self.assertFalse(s.store.row("SELECT 1 FROM clients"))
+
+    async def test_worker_retries_and_keeps_serving_previously_discovered_owners(self):
+        rows = [record(1, USER, NOW + DAY), record(2, USER + 1, NOW + DAY)]
+        clock = 0
+
+        async def request(method, route):
+            if route == "list":
+                if clock == 0:
+                    raise PanelError("offline")
+                return rows
+            owner = int(route.removeprefix("get/tgId/"))
+            return [{"client": row} for row in rows if row["tgId"] == owner]
+
+        s = self.open()
+        self.panel._request = AsyncMock(side_effect=request)
+        await s.subscriptions(USER)
+
+        async def advance(_):
+            nonlocal clock
+            if clock:
+                raise asyncio.CancelledError
+            self.assertEqual([r["chat"] for r in s.store.rows("SELECT chat FROM outgoing")], [USER])
+            clock = 60
+
+        with patch("watcher.telegram.time", SimpleNamespace(monotonic=lambda: clock)), \
+             patch("watcher.telegram.asyncio.sleep", side_effect=advance), \
+             self.assertLogs("watcher.telegram", level="WARNING"), self.assertRaises(asyncio.CancelledError):
+            await worker(s, AsyncMock())
+        self.assertEqual([r["chat"] for r in s.store.rows("SELECT chat FROM outgoing ORDER BY chat")],
+                         [USER, USER + 1])
+        self.assertEqual(self.panel._request.await_args_list.count(call("GET", "list")), 2)
 
     async def test_upgrade_with_existing_bindings_skips_full_restore(self):
         db = sqlite3.connect(self.path)

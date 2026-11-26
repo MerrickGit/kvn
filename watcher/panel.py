@@ -146,7 +146,9 @@ class Panel:
                 if owner <= 0:
                     continue
                 cid, email = row["id"], row["email"]
-                if type(cid) is not int or not 0 < cid < 2**63 or not isinstance(email, str) or not valid_email(email):
+                if type(cid) is not int or not 0 < cid < 2**63:
+                    raise ValueError()
+                if not isinstance(email, str) or not valid_email(email):
                     raise ValueError()
                 bindings.append((cid, email, owner))
         except (KeyError, ValueError, TypeError) as exc:
